@@ -1,0 +1,12 @@
+# Ignore Data Files
+*.nc
+*.tif
+*.tiff
+*.csv
+*.xlsx
+*.zip
+
+# Ignore System Files
+__pycache__/
+.vscode/
+.DS_Store
