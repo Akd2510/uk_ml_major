@@ -10,11 +10,10 @@ import os
 # ==========================================
 LANDSLIDE_CSV = 'Global_Landslide_Catalog_Export_rows.csv'
 OUTPUT_CSV = 'Final_Uttarakhand_Dataset_Complete.csv'
-ENABLE_DEMO_MODE = True  # Set to True to shift dates to 2020-2024 (Fixes date mismatch)
+ENABLE_DEMO_MODE = False  # Set to True to shift dates to 2020-2024 (Fixes date mismatch)
 
 # ==========================================
 # 1. SETUP GOOGLE EARTH ENGINE
-# ==========================================
 # ==========================================
 MY_PROJECT_ID = 'landslide-ml-2026' 
 
