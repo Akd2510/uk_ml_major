@@ -27,7 +27,7 @@ MY_PROJECT_ID = 'landslide-ml-2026'
 
 FEATURES = ['rainfall', 'rainfall_3d_cum',
             'elevation', 'slope', 'aspect',
-            'twi', 'curvature', 'tpi', 'ndvi']
+            'twi', 'curvature', 'tpi', 'ndvi','rain_slope_danger']
 
 # Map grid
 MAP_LAT_MIN, MAP_LAT_MAX = 28.7, 31.5
@@ -69,6 +69,7 @@ def train_model():
         return None, None
 
     df = pd.read_csv(INPUT_FILE)
+    df['rain_slope_danger'] = df['rainfall_3d_cum'] * df['slope']
     os.makedirs(FIG_DIR, exist_ok=True)
 
     available = [f for f in FEATURES if f in df.columns]
@@ -320,6 +321,7 @@ def generate_scenario_map(model, feature_names, grid_df,
     gdf = grid_df.copy()
     gdf['rainfall']        = scenario_cfg['rainfall']
     gdf['rainfall_3d_cum'] = scenario_cfg['rainfall_3d_cum']
+    gdf['rain_slope_danger'] = gdf['rainfall_3d_cum'] * gdf['slope']
     gdf = gdf.fillna(gdf.median(numeric_only=True))
 
     # Predict Probabilities
@@ -346,7 +348,7 @@ def generate_scenario_map(model, feature_names, grid_df,
     prob_smooth = np.clip(prob_smooth, 0, 1)
 
     # ── Plotting ──────────────────────────────────────────────
-    bounds     = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    bounds     = [0.0, 0.15, 0.30, 0.45, 0.60, 1.0]
     cls_labels = ['Very Low', 'Low', 'Moderate', 'High', 'Very High']
     cls_colors = ['#1a9641', '#a6d96a', '#ffffbf', '#fdae61', '#d7191c']
     cmap       = mcolors.ListedColormap(cls_colors)
