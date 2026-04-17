@@ -16,7 +16,7 @@ MY_PROJECT_ID = 'landslide-ml-2026'
 # Rainfall .nc files cover 2008–2017
 # Events outside this range will get rainfall = 0
 RAINFALL_YEAR_MIN = 2008
-RAINFALL_YEAR_MAX = 2017
+RAINFALL_YEAR_MAX = 2025
 
 
 # ─────────────────────────────────────────────
