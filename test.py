@@ -1,9 +1,10 @@
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg') # FIX: Force non-interactive backend to prevent Tkinter threading errors
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
-from matplotlib.colors import LightSource
 import seaborn as sns
 import shap
 import ee
@@ -27,12 +28,12 @@ MY_PROJECT_ID = 'landslide-ml-2026'
 
 FEATURES = ['rainfall', 'rainfall_3d_cum',
             'elevation', 'slope', 'aspect',
-            'twi', 'curvature', 'tpi', 'ndvi','rain_slope_danger']
+            'twi', 'curvature', 'tpi', 'ndvi']
 
 # Map grid
 MAP_LAT_MIN, MAP_LAT_MAX = 28.7, 31.5
 MAP_LON_MIN, MAP_LON_MAX = 77.5, 81.1
-MAP_RESOLUTION           = 0.02   # ~8 km
+MAP_RESOLUTION           = 0.08   # ~8 km
 
 # ── 3 Scenarios ───────────────────────────────
 # Rainfall values from actual NC files or realistic simulation
@@ -69,7 +70,6 @@ def train_model():
         return None, None
 
     df = pd.read_csv(INPUT_FILE)
-    df['rain_slope_danger'] = df['rainfall_3d_cum'] * df['slope']
     os.makedirs(FIG_DIR, exist_ok=True)
 
     available = [f for f in FEATURES if f in df.columns]
@@ -182,12 +182,13 @@ def get_or_build_terrain_grid():
     """
     Fetches terrain features for the map grid from GEE.
     Saves to CSV on first run — reuses it on every subsequent run.
+    This means GEE is only called ONCE ever for map generation.
     """
     if os.path.exists(TERRAIN_CACHE):
         print(f"✅ Loading cached terrain grid from {TERRAIN_CACHE}")
         return pd.read_csv(TERRAIN_CACHE)
 
-    print("📡 Building high-res terrain grid from GEE (one-time, will be cached)...")
+    print("📡 Building terrain grid from GEE (one-time, will be cached)...")
 
     try:
         ee.Initialize(project=MY_PROJECT_ID)
@@ -219,93 +220,83 @@ def get_or_build_terrain_grid():
     red  = ls8.select('SR_B4').multiply(0.0000275).add(-0.2)
     ndvi = nir.subtract(red).divide(nir.add(red)).rename('ndvi')
 
-    # Combine features AND add Pixel Coordinates (Longitude/Latitude)
     image = (terrain.select(['elevation', 'slope', 'aspect'])
              .addBands(twi).addBands(curvature)
-             .addBands(tpi).addBands(ndvi)
-             .addBands(ee.Image.pixelLonLat())) # <-- FIX: This automatically adds lat/lon bands
+             .addBands(tpi).addBands(ndvi))
 
+    # Sample entire region in one call
     region = ee.Geometry.Rectangle(
         [MAP_LON_MIN, MAP_LAT_MIN, MAP_LON_MAX, MAP_LAT_MAX])
 
-    print("   Sampling grid from GEE... (this might take a moment for high-res)")
+    print("   Sampling grid from GEE...")
     sample  = image.sample(
         region=region,
         scale=int(MAP_RESOLUTION * 111000),  # degrees → approximate metres
-        geometries=False, # <-- FIX: Set to False because coords are now bands
+        geometries=True,
         seed=42
     )
+    result  = sample.getInfo()
+    print(f"   GEE returned {len(result['features'])} grid points.")
 
-    # <-- FIX: Bypass the 5000 element limit by downloading directly as CSV via URL
-    try:
-        url = sample.getDownloadURL(filetype='csv')
-        response = requests.get(url)
-        grid_df = pd.read_csv(io.StringIO(response.text))
-    except Exception as e:
-        print(f"❌ Error downloading from GEE: {e}")
-        return None
+    records = []
+    for f in result['features']:
+        p   = f['properties']
+        geo = f['geometry']['coordinates']
+        records.append({
+            'longitude': geo[0],
+            'latitude':  geo[1],
+            'elevation': p.get('elevation', np.nan),
+            'slope':     p.get('slope',     np.nan),
+            'aspect':    p.get('aspect',    np.nan),
+            'twi':       p.get('twi',       np.nan),
+            'curvature': p.get('curvature', np.nan),
+            'tpi':       p.get('tpi',       np.nan),
+            'ndvi':      p.get('ndvi',      np.nan),
+        })
 
-    print(f"   GEE returned {len(grid_df)} grid points.")
-
-    # Fill NaNs with medians and clean up unneeded columns
+    grid_df = pd.DataFrame(records)
     grid_df = grid_df.fillna(grid_df.median(numeric_only=True))
-    if 'system:index' in grid_df.columns:
-        grid_df = grid_df.drop(columns=['system:index'])
-    if '.geo' in grid_df.columns:
-        grid_df = grid_df.drop(columns=['.geo'])
 
     os.makedirs(os.path.dirname(TERRAIN_CACHE), exist_ok=True)
     grid_df.to_csv(TERRAIN_CACHE, index=False)
     print(f"✅ Terrain grid cached → {TERRAIN_CACHE}")
     return grid_df
 
+
 # ─────────────────────────────────────────────
 # DISTRICT BOUNDARIES
 # ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# DISTRICT BOUNDARIES (USING GOOGLE EARTH ENGINE)
-# ─────────────────────────────────────────────
 def get_uttarakhand_districts():
     """
-    Fetches official Uttarakhand district boundaries directly from 
-    Google Earth Engine (FAO GAUL dataset) instead of a web URL.
+    Downloads Uttarakhand district boundaries from a public source.
+    Returns a list of (district_name, [(lon,lat), ...]) polygons,
+    or None if download fails.
     """
-    print("🗺️  Fetching Uttarakhand district boundaries from GEE...")
     try:
-        import ee
-        
-        # Ensure GEE is initialized
-        try:
-            ee.Number(1).getInfo()
-        except Exception:
-            ee.Initialize(project=MY_PROJECT_ID)
-
-        # Access the FAO GAUL dataset (Level 2 = Districts)
-        districts_fc = ee.FeatureCollection("FAO/GAUL/2015/level2") \
-                         .filter(ee.Filter.eq('ADM1_NAME', 'Uttarakhand'))
-        
-        # Download the coordinates
-        features = districts_fc.getInfo()['features']
-        
+        import json
+        print("🗺️  Downloading Uttarakhand district boundaries...")
+        url = ("https://raw.githubusercontent.com/datameet/maps/master/"
+               "Districts/Uttarakhand.geojson")
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            print("   ⚠️  Could not download boundaries — map will still generate.")
+            return None
+        gj       = r.json()
         districts = []
-        for feat in features:
-            # ADM2_NAME is the district name in the GAUL dataset
-            name = feat['properties'].get('ADM2_NAME', 'Unknown')
+        for feat in gj['features']:
+            name = feat['properties'].get('DISTRICT', 
+                   feat['properties'].get('district', 'Unknown'))
             geom = feat['geometry']
-            
-            # Extract polygon coordinates
             if geom['type'] == 'Polygon':
                 coords = geom['coordinates'][0]
                 districts.append((name, coords))
             elif geom['type'] == 'MultiPolygon':
                 for poly in geom['coordinates']:
                     districts.append((name, poly[0]))
-                    
-        print(f"   ✅ Loaded {len(districts)} district polygons directly from Cloud.")
+        print(f"   ✅ Loaded {len(districts)} district polygons.")
         return districts
-        
     except Exception as e:
-        print(f"   ⚠️  GEE district fetch failed ({e}) — map will still generate.")
+        print(f"   ⚠️  District download failed ({e}) — map will still generate.")
         return None
 
 
@@ -314,100 +305,99 @@ def get_uttarakhand_districts():
 # ─────────────────────────────────────────────
 def generate_scenario_map(model, feature_names, grid_df,
                           scenario_name, scenario_cfg, districts):
-    """Generates a highly realistic susceptibility map with 3D hillshading."""
+    """Generates one susceptibility map for a given rainfall scenario."""
 
-    print(f"\n🗺️  Generating realistic map: {scenario_name}")
+    print(f"\n🗺️  Generating map: {scenario_name}")
 
     gdf = grid_df.copy()
     gdf['rainfall']        = scenario_cfg['rainfall']
     gdf['rainfall_3d_cum'] = scenario_cfg['rainfall_3d_cum']
-    gdf['rain_slope_danger'] = gdf['rainfall_3d_cum'] * gdf['slope']
     gdf = gdf.fillna(gdf.median(numeric_only=True))
 
-    # Predict Probabilities
+    # Predict
     X_grid = gdf[feature_names].values
     probs  = model.predict_proba(X_grid)[:, 1]
     gdf['probability'] = probs
 
-    # Pivot to 2D Arrays
+    # Pivot to 2D
     gdf      = gdf.sort_values(['latitude', 'longitude'])
     lats_u   = np.sort(gdf['latitude'].unique())
     lons_u   = np.sort(gdf['longitude'].unique())
-    
-    prob_2d  = gdf.pivot_table(index='latitude', columns='longitude', values='probability', aggfunc='mean').values
-    slope_2d = gdf.pivot_table(index='latitude', columns='longitude', values='slope', aggfunc='mean').values
-    elev_2d  = gdf.pivot_table(index='latitude', columns='longitude', values='elevation', aggfunc='mean').values
+    prob_2d  = gdf.pivot_table(
+        index='latitude', columns='longitude',
+        values='probability', aggfunc='mean').values
+    slope_2d = gdf.pivot_table(
+        index='latitude', columns='longitude',
+        values='slope', aggfunc='mean').values
 
-    # Post-processing & Smart Masking
-    prob_smooth = gaussian_filter(prob_2d, sigma=1.5) # Lowered sigma because grid is finer
-    
-    # Realistic Masks: No landslides on flat plains OR permanent glaciers (>5000m)
-    prob_smooth[slope_2d < 5] = 0.0          
-    prob_smooth[elev_2d > 5000] = np.nan # High-alpine mask
-    
+    # Post-processing
+    prob_smooth = gaussian_filter(prob_2d, sigma=3.5)
+    prob_smooth[slope_2d < 5] = 0.0          # flat terrain = zero risk
     prob_smooth = np.clip(prob_smooth, 0, 1)
 
-    # ── Plotting ──────────────────────────────────────────────
-    bounds     = [0.0, 0.15, 0.30, 0.45, 0.60, 1.0]
+    # ── Plot ──────────────────────────────────────────────
+    bounds     = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     cls_labels = ['Very Low', 'Low', 'Moderate', 'High', 'Very High']
     cls_colors = ['#1a9641', '#a6d96a', '#ffffbf', '#fdae61', '#d7191c']
     cmap       = mcolors.ListedColormap(cls_colors)
-    cmap.set_bad(color='white', alpha=0) # Make NaN (glaciers) transparent
     norm       = mcolors.BoundaryNorm(bounds, cmap.N)
 
     lon_grid, lat_grid = np.meshgrid(lons_u, lats_u)
 
-    fig, ax = plt.subplots(figsize=(12, 10), facecolor='white')
-
-    # 1. Generate the 3D Hillshade Background
-    ls = LightSource(azdeg=315, altdeg=45)
-    hillshade = ls.hillshade(elev_2d, vert_exag=1.5, dx=MAP_RESOLUTION, dy=MAP_RESOLUTION)
-    ax.pcolormesh(lon_grid, lat_grid, hillshade, cmap='gray', shading='gouraud', zorder=1)
-
-    # 2. Overlay the Susceptibility colors with transparency (alpha=0.65)
-    ax.pcolormesh(lon_grid, lat_grid, prob_smooth, cmap=cmap, norm=norm, 
-                  shading='auto', zorder=2, alpha=0.65)
+    fig, ax = plt.subplots(figsize=(11, 10))
+    ax.pcolormesh(lon_grid, lat_grid, prob_smooth,
+                  cmap=cmap, norm=norm, shading='auto', zorder=1)
 
     # ── District boundaries overlay ───────────────────────
     if districts:
         for name, coords in districts:
             xs = [c[0] for c in coords]
             ys = [c[1] for c in coords]
-            ax.plot(xs, ys, color='#222222', linewidth=1.2, zorder=3, alpha=0.8) # Thicker, darker borders
-            
-            cx, cy = np.mean(xs), np.mean(ys)
-            if (MAP_LON_MIN < cx < MAP_LON_MAX and MAP_LAT_MIN < cy < MAP_LAT_MAX):
-                ax.text(cx, cy, name, fontsize=7, ha='center', va='center',
-                        color='black', zorder=4, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.6, edgecolor='gray'))
+            ax.plot(xs, ys, color='#333333',
+                    linewidth=0.8, zorder=3, alpha=0.7)
+            # Label centroid
+            cx = np.mean(xs)
+            cy = np.mean(ys)
+            if (MAP_LON_MIN < cx < MAP_LON_MAX and
+                    MAP_LAT_MIN < cy < MAP_LAT_MAX):
+                ax.text(cx, cy, name, fontsize=6,
+                        ha='center', va='center',
+                        color='#111111', zorder=4,
+                        fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.1',
+                                  facecolor='white',
+                                  alpha=0.5,
+                                  edgecolor='none'))
 
     # ── Colorbar ──────────────────────────────────────────
     sm   = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    cbar = fig.colorbar(sm, ax=ax, ticks=bounds, shrink=0.65, pad=0.08)
-    cbar.set_label('Landslide Susceptibility Probability', fontsize=11, weight='bold')
+    cbar = fig.colorbar(sm, ax=ax, ticks=bounds,
+                        shrink=0.65, pad=0.12)
+    cbar.set_label('Susceptibility Probability', fontsize=11)
     cbar.ax.set_yticklabels([f'{b:.1f}' for b in bounds])
 
     # Class label patches
-    patches = [mpatches.Patch(color=cls_colors[i], label=cls_labels[i]) for i in range(5)]
-    patches.append(mpatches.Patch(color='white', label='Glacier/Flat (Masked)', alpha=0.5))
-    ax.legend(handles=patches, loc='lower left', fontsize=9, title='Risk Class',
-              title_fontsize=10, framealpha=0.9, edgecolor='black')
+    patches = [mpatches.Patch(color=cls_colors[i], label=cls_labels[i])
+               for i in range(5)]
+    ax.legend(handles=patches, loc='lower left',
+              fontsize=8, title='Risk Class',
+              title_fontsize=9, framealpha=0.85)
 
     ax.set_xlim(MAP_LON_MIN, MAP_LON_MAX)
     ax.set_ylim(MAP_LAT_MIN, MAP_LAT_MAX)
-    ax.set_title(f'Landslide Susceptibility Micro-Zonation\n{scenario_cfg["title"]}', 
-                 fontsize=14, weight='bold', pad=15)
-    ax.set_xlabel('Longitude', fontsize=11)
-    ax.set_ylabel('Latitude',  fontsize=11)
-    
-    # Remove top and right spines for a cleaner look
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    ax.set_title(
+        f'Landslide & Flash Flood Susceptibility — Uttarakhand\n'
+        f'{scenario_cfg["title"]}',
+        fontsize=12, pad=12)
+    ax.set_xlabel('Longitude', fontsize=10)
+    ax.set_ylabel('Latitude',  fontsize=10)
 
     out_path = os.path.join(FIG_DIR, scenario_cfg['filename'])
-    fig.savefig(out_path, dpi=300, bbox_inches='tight') # Boosted DPI to 300 for crisp text
-    plt.close('all')
-    print(f"   ✅ Saved Realistic Map → {out_path}")
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close('all') # FIX: Clear all plots from memory to prevent overlap and threading issues
+    print(f"   ✅ Saved → {out_path}")
+
+
 # ─────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────
